@@ -1,0 +1,64 @@
+// ============================================================
+// OPTIMIZED DESIGN - D Flip-Flop
+// Key improvements over original:
+//   1. always_ff instead of always (explicit sequential intent)
+//   2. Parameterized WIDTH (scalable to N-bit DFF)
+//   3. Modports for clear signal direction ownership
+//   4. SVA Assertions for automatic formal/simulation checking
+// ============================================================
+
+module dff #(parameter WIDTH = 1) (dff_if vif);
+
+  // always_ff is preferred over always for sequential logic
+  // Tools enforce no combinational assignments inside
+  always_ff @(posedge vif.clk) begin
+    if (vif.rst)
+      vif.dout <= '0;       // '0 is width-agnostic, works for any WIDTH
+    else
+      vif.dout <= vif.din;
+  end
+
+endmodule
+
+
+// ============================================================
+// OPTIMIZED INTERFACE
+// ============================================================
+
+interface dff_if #(parameter WIDTH = 1);
+  logic              clk;
+  logic              rst;
+  logic [WIDTH-1:0]  din;
+  logic [WIDTH-1:0]  dout;
+
+  // Modports: enforce who drives what
+  // DUT drives dout; TB drives rst and din
+  modport DUT_MP (input  clk, rst, din,
+                  output dout);
+
+  modport TB_MP  (input  clk, dout,
+                  output rst, din);
+
+  // ----------------------------------------------------------
+  // SVA (SystemVerilog Assertions)
+  // These run automatically during simulation alongside the TB
+  // and catch bugs without needing scoreboard comparison
+  // ----------------------------------------------------------
+
+  // P1: When reset is asserted, dout MUST be 0 the very next cycle
+  property p_reset;
+    @(posedge clk) rst |=> (dout == '0);
+  endproperty
+
+  // P2: When NOT in reset, dout must follow din after exactly 1 clock
+  property p_dff_data;
+    @(posedge clk) !rst |=> (dout == $past(din));
+  endproperty
+
+  AP_RESET    : assert property (p_reset)
+    else $error("[ASSERT][FAIL] Reset check failed at time %0t ns", $time);
+
+  AP_DFF_DATA : assert property (p_dff_data)
+    else $error("[ASSERT][FAIL] DFF data propagation failed at time %0t ns", $time);
+
+endinterface
