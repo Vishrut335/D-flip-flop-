@@ -1,0 +1,314 @@
+// ============================================================
+// OPTIMIZED TESTBENCH - D Flip-Flop
+// Key improvements over original:
+//   1. Covergroup in transaction for functional coverage tracking
+//   2. Monitor bug fix: fresh object per iteration (no stale reference)
+//   3. Scoreboard: pass/fail counters + summary report
+//   4. Environment: watchdog timer to prevent infinite hang
+//   5. $fatal instead of $error for randomization failure (halts sim)
+//   6. Timestamps on display messages for easier waveform correlation
+//   7. Constraint added (scales cleanly when WIDTH is increased)
+// ============================================================
+
+
+// ============================================================
+// TRANSACTION
+// ============================================================
+
+class transaction;
+  rand bit din;
+  bit      dout;
+  time     timestamp;   // when this transaction was created
+
+  // Constraint: explicit range — scales naturally if din becomes multi-bit
+  constraint c_valid { din inside {0, 1}; }
+
+  // Functional Coverage
+  // Tracks: did we see din=0, din=1, dout=0, dout=1, and all 4 cross combos?
+  covergroup dff_cg;
+    cp_din  : coverpoint din  { bins zero = {0}; bins one = {1}; }
+    cp_dout : coverpoint dout { bins zero = {0}; bins one = {1}; }
+    cp_cross: cross cp_din, cp_dout;  // checks all 4 input/output combinations
+  endgroup
+
+  function new();
+    dff_cg = new();   // covergroup must be instantiated in new()
+  endfunction
+
+  // Call this after dout is captured to record into coverage database
+  function void sample_cov();
+    dff_cg.sample();
+  endfunction
+
+  function transaction copy();
+    copy           = new();
+    copy.din       = this.din;
+    copy.dout      = this.dout;
+    copy.timestamp = this.timestamp;
+  endfunction
+
+  function void display(input string tag);
+    $display("[%0t][%0s] DIN: %0b | DOUT: %0b", $time, tag, din, dout);
+  endfunction
+
+endclass
+
+
+// ============================================================
+// GENERATOR
+// ============================================================
+
+class generator;
+  transaction              tr;
+  mailbox #(transaction)   mbx;      // to driver
+  mailbox #(transaction)   mbxref;   // golden copy to scoreboard
+  event                    sconext;  // wait for scoreboard to finish
+  event                    done;     // signals all stimuli sent
+  int                      count;
+
+  function new(mailbox #(transaction) mbx, mailbox #(transaction) mbxref);
+    this.mbx    = mbx;
+    this.mbxref = mbxref;
+    tr = new();
+  endfunction
+
+  task run();
+    repeat(count) begin
+      // $fatal halts simulation immediately — better than $error for rand failure
+      assert(tr.randomize()) else $fatal(1, "[GEN] RANDOMIZATION FAILED");
+      tr.timestamp = $time;
+      mbx.put(tr.copy());       // send to driver
+      mbxref.put(tr.copy());    // send golden copy to scoreboard
+      tr.display("GEN");
+      @(sconext);               // wait for scoreboard to finish comparison
+    end
+    ->done;
+  endtask
+
+endclass
+
+
+// ============================================================
+// DRIVER
+// ============================================================
+
+class driver;
+  transaction            tr;
+  mailbox #(transaction) mbx;
+  virtual dff_if         vif;
+
+  function new(mailbox #(transaction) mbx);
+    this.mbx = mbx;
+  endfunction
+
+  task reset();
+    vif.rst <= 1'b1;
+    repeat(5) @(posedge vif.clk);
+    vif.rst <= 1'b0;
+    @(posedge vif.clk);
+    $display("[%0t][DRV] RESET DONE", $time);
+  endtask
+
+  task run();
+    forever begin
+      mbx.get(tr);
+      vif.din <= tr.din;
+      @(posedge vif.clk);
+      tr.display("DRV");
+      vif.din <= 1'b0;
+      @(posedge vif.clk);
+    end
+  endtask
+
+endclass
+
+
+// ============================================================
+// MONITOR
+// ============================================================
+
+class monitor;
+  transaction            tr;
+  mailbox #(transaction) mbx;
+  virtual dff_if         vif;
+
+  function new(mailbox #(transaction) mbx);
+    this.mbx = mbx;
+  endfunction
+
+  task run();
+    forever begin
+      tr = new();  // IMPORTANT: fresh object every iteration
+                   // Original bug: reusing same object meant all mailbox
+                   // entries pointed to the same memory location
+
+      repeat(2) @(posedge vif.clk);  // wait for DFF output to stabilize
+      tr.dout = vif.dout;
+      tr.sample_cov();   // sample coverage after dout is captured
+      mbx.put(tr);       // safe now — unique object each time
+      tr.display("MON");
+    end
+  endtask
+
+endclass
+
+
+// ============================================================
+// SCOREBOARD
+// ============================================================
+
+class scoreboard;
+  transaction            tr;
+  transaction            trref;
+  mailbox #(transaction) mbx;       // from monitor
+  mailbox #(transaction) mbxref;    // golden from generator
+  event                  sconext;
+
+  // Pass/fail counters
+  int pass_count = 0;
+  int fail_count = 0;
+
+  function new(mailbox #(transaction) mbx, mailbox #(transaction) mbxref);
+    this.mbx    = mbx;
+    this.mbxref = mbxref;
+  endfunction
+
+  task run();
+    forever begin
+      mbx.get(tr);
+      mbxref.get(trref);
+      tr.display("SCO");
+      trref.display("REF");
+
+      if (tr.dout == trref.din) begin
+        $display("[SCO] : DATA MATCHED");
+        pass_count++;
+      end else begin
+        // $error prints but doesn't halt — lets all tests run then we see summary
+        $error("[SCO] : MISMATCH | Got DOUT=%0b | Expected=%0b", tr.dout, trref.din);
+        fail_count++;
+      end
+
+      $display("-------------------------------------------------");
+      ->sconext;
+    end
+  endtask
+
+  // Call this at end of simulation for a clean summary
+  function void report();
+    $display("==============================================");
+    $display("           SIMULATION SUMMARY");
+    $display("==============================================");
+    $display("  TOTAL  : %0d", pass_count + fail_count);
+    $display("  PASSED : %0d", pass_count);
+    $display("  FAILED : %0d", fail_count);
+    $display("  STATUS : %0s",
+              (fail_count == 0) ? "ALL TESTS PASSED" : "FAILURES DETECTED");
+    $display("==============================================");
+  endfunction
+
+endclass
+
+
+// ============================================================
+// ENVIRONMENT
+// ============================================================
+
+class environment;
+  generator  gen;
+  driver     drv;
+  monitor    mon;
+  scoreboard sco;
+
+  event next;
+
+  mailbox #(transaction) gdmbx;    // generator -> driver
+  mailbox #(transaction) msmbx;    // monitor   -> scoreboard
+  mailbox #(transaction) mbxref;   // generator -> scoreboard (golden)
+
+  virtual dff_if vif;
+
+  // Watchdog: simulation auto-fails if this time is exceeded (in ns)
+  // Prevents infinite hangs if a mailbox get() is never satisfied
+  int timeout_ns = 50000;
+
+  function new(virtual dff_if vif);
+    gdmbx  = new();
+    mbxref = new();
+    msmbx  = new();
+
+    gen = new(gdmbx, mbxref);
+    drv = new(gdmbx);
+    mon = new(msmbx);
+    sco = new(msmbx, mbxref);
+
+    this.vif    = vif;
+    drv.vif     = this.vif;
+    mon.vif     = this.vif;
+    gen.sconext = next;
+    sco.sconext = next;
+  endfunction
+
+  task pre_test();
+    drv.reset();
+  endtask
+
+  task test();
+    fork
+      gen.run();
+      drv.run();
+      mon.run();
+      sco.run();
+    join_any
+  endtask
+
+  task post_test();
+    wait(gen.done.triggered);
+    sco.report();   // print summary before finishing
+    $finish();
+  endtask
+
+  task run();
+    fork
+      // Watchdog thread — kills sim if it runs too long
+      begin
+        #(timeout_ns * 1ns);
+        $fatal(1, "[ENV] WATCHDOG: Simulation exceeded %0d ns timeout", timeout_ns);
+      end
+      // Main test thread
+      begin
+        pre_test();
+        test();
+        post_test();
+      end
+    join_any
+  endtask
+
+endclass
+
+
+// ============================================================
+// TESTBENCH TOP
+// ============================================================
+
+module tb;
+  dff_if vif();
+  dff    dut(vif);
+
+  initial vif.clk <= 0;
+  always #10 vif.clk <= ~vif.clk;
+
+  environment env;
+
+  initial begin
+    env           = new(vif);
+    env.gen.count = 30;
+    env.run();
+  end
+
+  initial begin
+    $dumpfile("dump.vcd");
+    $dumpvars;
+  end
+
+endmodule
